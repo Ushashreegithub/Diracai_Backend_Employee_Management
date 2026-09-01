@@ -1185,11 +1185,13 @@ class EmployeeTicketAttachmentSerializer(serializers.ModelSerializer):
 
 class EmployeeTicketCommentSerializer(serializers.ModelSerializer):
     author = serializers.SerializerMethodField()
+    author_name = serializers.SerializerMethodField()
+    author_employee_id = serializers.SerializerMethodField()
 
     class Meta:
         model = EmployeeTicketComment
-        fields = ['id', 'ticket', 'text', 'author', 'created_at']
-        read_only_fields = ['id', 'author', 'created_at']
+        fields = ['id', 'ticket', 'text', 'author', 'author_name', 'author_employee_id', 'created_at']
+        read_only_fields = ['id', 'author', 'author_name', 'author_employee_id', 'created_at']
 
     def get_author(self, obj):
         employee = getattr(obj, "author_employee", None)
@@ -1199,11 +1201,26 @@ class EmployeeTicketCommentSerializer(serializers.ModelSerializer):
                 "id": employee.id,
                 "name": _employee_label(employee),
                 "email": getattr(getattr(employee, "user", None), "email", "") or "",
-                "employee_code": getattr(employee, "employee_id", ""),
+                "employee_id": getattr(employee, "employee_id", ""),
             }
         if user:
             return {"id": user.id, "name": _user_label(user)}
         return None
+
+    def get_author_name(self, obj):
+        employee = getattr(obj, "author_employee", None)
+        user = getattr(obj, "author", None)
+        if employee:
+            return _employee_label(employee)
+        if user:
+            return _user_label(user)
+        return "Unknown"
+
+    def get_author_employee_id(self, obj):
+        employee = getattr(obj, "author_employee", None)
+        if employee:
+            return getattr(employee, "employee_id", "") or ""
+        return ""
 
 
 class EmployeeTicketAssignmentHistorySerializer(serializers.ModelSerializer):
