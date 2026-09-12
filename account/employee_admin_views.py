@@ -28,6 +28,7 @@ from account.employee_models import (
     OvertimeRequest,
     EmployeeTicket,
     EmployeeTicketAssignmentHistory,
+    EmployeeTicketAttachment,
     EmployeeTicketComment,
 )
 from account.models import Project
@@ -131,14 +132,72 @@ def _can_access_ticket(user, ticket):
         return True
     if not user or not getattr(user, "is_authenticated", False):
         return False
+
     me = getattr(user, "employee_profile", None)
     if not me:
         return False
+
     if getattr(ticket, "employee_id", None) == me.id:
         return True
+
     if getattr(ticket, "assigned_to_id", None) == me.id:
         return True
+
+    try:
+        if ticket.assignees.filter(id=me.id).exists():
+            return True
+    except Exception:
+        pass
+
     return False
+
+
+def _can_modify_ticket_comment(user, comment):
+    """
+    Admins can modify any comment.
+
+    Employees can modify a comment only when:
+    1. They are an assignee of the ticket.
+    2. The comment belongs to them.
+    """
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+
+    # Admin can edit/delete any comment.
+    if _is_admin(user):
+        return True
+
+    employee = getattr(user, "employee_profile", None)
+    if not employee:
+        return False
+
+    # The logged-in employee must be the author.
+    author_matches = comment.author_id == user.id
+
+    # Fallback for comments where author may be represented
+    # through author_employee.
+    if not author_matches:
+        author_employee = getattr(comment, "author_employee", None)
+        author_matches = bool(
+            author_employee and author_employee.user_id == user.id
+        )
+
+    if not author_matches:
+        return False
+
+    ticket = getattr(comment, "ticket", None)
+    if not ticket:
+        return False
+
+    # Current multi-assignee system.
+    try:
+        if ticket.assignees.filter(pk=employee.pk).exists():
+            return True
+    except Exception:
+        pass
+
+    # Backward compatibility with the old primary assignee field.
+    return getattr(ticket, "assigned_to_id", None) == employee.pk
 
 
 class EmployeesAPI(DebugForce200Mixin, APIView):
@@ -799,6 +858,9 @@ class EmployeeTicketsAPI(DebugForce200Mixin, APIView):
             "assigned_to",
             "assigned_to__user",
             "assigned_by",
+        ).prefetch_related(
+            "assignees",
+            "assignees__user",
         ).all()
 
         is_admin = _is_admin(request.user)
@@ -814,18 +876,32 @@ class EmployeeTicketsAPI(DebugForce200Mixin, APIView):
                 return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
             me = request.user.employee_profile
             if assigned_to_param and str(assigned_to_param).strip().lower() == "me":
-                qs = qs.filter(assigned_to=me)
+                qs = qs.filter(Q(assigned_to=me) | Q(assignees=me)).distinct()
             else:
                 if employee and employee.id != me.id:
                     return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
                 # Employee views should include owned + reassigned tickets.
-                qs = qs.filter(Q(employee=me) | Q(assigned_to=me))
+                qs = qs.filter(Q(employee=me) | Q(assigned_to=me) | Q(assignees=me)).distinct()
 
         if assigned_to_param and str(assigned_to_param).strip().lower() != "me":
             try:
                 qs = qs.filter(assigned_to_id=int(str(assigned_to_param).strip()))
             except Exception:
                 pass
+
+        project_param = request.query_params.get("project_id") or request.query_params.get("project")
+        if project_param:
+            try:
+                pid = int(str(project_param).strip())
+                from account.employee_models import (
+                    PrivateProjectTicketAssignment,
+                    CurrentProjectTicketAssignment,
+                )
+                pt_ids = set(PrivateProjectTicketAssignment.objects.filter(plan__project_id=pid).values_list("ticket_id", flat=True))
+                ct_ids = set(CurrentProjectTicketAssignment.objects.filter(plan__project_id=pid).values_list("ticket_id", flat=True))
+                qs = qs.filter(pk__in=(pt_ids | ct_ids))
+            except (ValueError, TypeError):
+                qs = qs.none()
 
         if unassigned:
             qs = qs.filter(assigned_to__isnull=True)
@@ -867,7 +943,7 @@ class EmployeeTicketsAPI(DebugForce200Mixin, APIView):
         if ordering in allowed_ordering:
             qs = qs.order_by(ordering)
         else:
-            qs = qs.order_by("-created_at")
+            qs = qs.order_by("created_at")
 
         paginator = DefaultPageNumberPagination()
         page = paginator.paginate_queryset(qs, request, view=self)
@@ -904,20 +980,34 @@ class EmployeeTicketDetailAPI(DebugForce200Mixin, APIView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_permissions(self):
-        if self.request.method == 'GET' and settings.DEBUG:
+        if self.request.method == "GET" and settings.DEBUG:
             return [AllowAny()]
         return [IsAuthenticated()]
 
     def get_object(self, pk):
         try:
-            return EmployeeTicket.objects.select_related(
-                "employee",
-                "employee__user",
-                "created_by",
-                "assigned_to",
-                "assigned_to__user",
-                "assigned_by",
-            ).prefetch_related("attachments", "assignment_history", "comments").get(pk=pk)
+            return (
+                EmployeeTicket.objects
+                .select_related(
+                    "employee",
+                    "employee__user",
+                    "created_by",
+                    "assigned_to",
+                    "assigned_to__user",
+                    "assigned_by",
+                )
+                .prefetch_related(
+                    "attachments",
+                    "assignment_history",
+                    "comments",
+                    "comments__author",
+                    "comments__author_employee",
+                    "comments__author_employee__user",
+                    "assignees",
+                    "assignees__user",
+                )
+                .get(pk=pk)
+            )
         except EmployeeTicket.DoesNotExist:
             return None
 
@@ -925,43 +1015,50 @@ class EmployeeTicketDetailAPI(DebugForce200Mixin, APIView):
         obj = self.get_object(pk)
         if not obj:
             return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
         if _is_admin(request.user):
-            return Response(EmployeeTicketDetailSerializer(obj, context={"request": request}).data, status=status.HTTP_200_OK)
+            return Response(
+                EmployeeTicketDetailSerializer(obj, context={"request": request}).data,
+                status=status.HTTP_200_OK,
+            )
+
         if not getattr(request.user, "is_authenticated", False) and settings.DEBUG:
-            return Response(EmployeeTicketDetailSerializer(obj, context={"request": request}).data, status=status.HTTP_200_OK)
-        if hasattr(request.user, "employee_profile"):
-            me = request.user.employee_profile
-            if obj.employee_id == me.id or getattr(obj, "assigned_to_id", None) == me.id:
-                return Response(EmployeeTicketDetailSerializer(obj, context={"request": request}).data, status=status.HTTP_200_OK)
+            return Response(
+                EmployeeTicketDetailSerializer(obj, context={"request": request}).data,
+                status=status.HTTP_200_OK,
+            )
+
+        if _can_access_ticket(request.user, obj):
+            return Response(
+                EmployeeTicketDetailSerializer(obj, context={"request": request}).data,
+                status=status.HTTP_200_OK,
+            )
+
         return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
 
     def patch(self, request, pk):
         obj = self.get_object(pk)
         if not obj:
             return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
         if not _is_admin(request.user):
             if not _can_access_ticket(request.user, obj):
                 return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
             comment_keys = [
-                "text",
-                "comment",
-                "message",
-                "employee_comment",
-                "commenttext",
-                "commentText",
-                "comment_text",
-                "work",
-                "work_update",
-                "workUpdate",
-                "update",
+                "text", "comment", "message", "employee_comment",
+                "commenttext", "commentText", "comment_text",
+                "work", "work_update", "workUpdate", "update",
             ]
+
             text = None
-            for k in comment_keys:
-                if k in request.data:
-                    text = request.data.get(k)
+            for key in comment_keys:
+                if key in request.data:
+                    text = request.data.get(key)
                     break
 
-            status_value = request.data.get("status", None)
+            status_value = request.data.get("status")
+
             if status_value not in (None, "", "null"):
                 mapped_status = _ticket_status_from_api(status_value)
                 if mapped_status in {"open", "in_progress", "resolved", "closed"}:
@@ -972,38 +1069,92 @@ class EmployeeTicketDetailAPI(DebugForce200Mixin, APIView):
                 EmployeeTicketComment.objects.create(
                     ticket=obj,
                     author=request.user,
-                    author_employee=getattr(request.user, "employee_profile", None) if getattr(request.user, "is_authenticated", False) else None,
+                    author_employee=getattr(request.user, "employee_profile", None),
                     text=text.strip(),
                 )
 
             if (status_value in (None, "", "null")) and not (isinstance(text, str) and text.strip()):
                 return Response(
-                    {
-                        "detail": "No writable fields for employee",
-                        "allowed": ["status"] + comment_keys,
-                    },
+                    {"detail": "No writable fields for employee", "allowed": ["status"] + comment_keys},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
             obj = self.get_object(pk)
-            return Response(EmployeeTicketDetailSerializer(obj, context={"request": request}).data, status=status.HTTP_200_OK)
-        payload = request.data.copy() if hasattr(request.data, "copy") else dict(request.data)
-        if "assigned_to_id" not in payload:
-            if "assigned_to" in payload:
-                assigned = payload.get("assigned_to")
-                if isinstance(assigned, dict):
-                    payload["assigned_to_id"] = assigned.get("id")
-                else:
-                    payload["assigned_to_id"] = assigned
-            elif "new_employee_id" in payload:
-                payload["assigned_to_id"] = payload.get("new_employee_id")
+            return Response(
+                EmployeeTicketDetailSerializer(obj, context={"request": request}).data,
+                status=status.HTTP_200_OK,
+            )
 
-        serializer = EmployeeTicketDetailSerializer(obj, data=payload, partial=True, context={"request": request})
+        payload = request.data.copy() if hasattr(request.data, "copy") else dict(request.data)
+
+        # Preserve the COMPLETE assignee array. Do not collapse it to the first employee.
+        if "assignee_ids" in payload:
+            raw = payload.get("assignee_ids")
+        elif "assigned_to_ids" in payload:
+            raw = payload.get("assigned_to_ids")
+            payload["assignee_ids"] = raw
+        elif "assignees" in payload:
+            raw = payload.get("assignees")
+            payload["assignee_ids"] = raw
+        elif "assigned_to_id" in payload:
+            raw = [payload.get("assigned_to_id")]
+            payload["assignee_ids"] = raw
+        elif "assigned_to" in payload:
+            raw = payload.get("assigned_to")
+            payload["assignee_ids"] = [raw]
+        elif "new_employee_id" in payload:
+            raw = [payload.get("new_employee_id")]
+            payload["assignee_ids"] = raw
+        else:
+            raw = None
+
+        if raw is not None:
+            if isinstance(raw, str):
+                raw = raw.strip()
+                if raw:
+                    try:
+                        import json
+                        raw = json.loads(raw)
+                    except Exception:
+                        raw = [x.strip() for x in raw.split(",") if x.strip()]
+                else:
+                    raw = []
+
+            if not isinstance(raw, (list, tuple)):
+                raw = [raw]
+
+            normalized_ids = []
+            for item in raw:
+                if isinstance(item, dict):
+                    item = item.get("id") or item.get("employee_id") or item.get("employeeId")
+                try:
+                    value = int(item)
+                    if value > 0:
+                        normalized_ids.append(value)
+                except (TypeError, ValueError):
+                    continue
+
+            payload["assignee_ids"] = normalized_ids
+            # assignee_ids is the canonical write field.
+            payload.pop("assigned_to_ids", None)
+            payload.pop("assignees", None)
+
+        serializer = EmployeeTicketDetailSerializer(
+            obj,
+            data=payload,
+            partial=True,
+            context={"request": request},
+        )
         serializer.is_valid(raise_exception=True)
+
         with transaction.atomic():
             obj = serializer.save()
 
-        return Response(EmployeeTicketDetailSerializer(obj, context={"request": request}).data, status=status.HTTP_200_OK)
+        obj = self.get_object(pk)
+        return Response(
+            EmployeeTicketDetailSerializer(obj, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     def post(self, request, pk):
         return self.patch(request, pk)
@@ -1014,9 +1165,11 @@ class EmployeeTicketDetailAPI(DebugForce200Mixin, APIView):
     def delete(self, request, pk):
         if not _is_admin(request.user):
             return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
         obj = self.get_object(pk)
         if not obj:
             return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
         obj.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -1041,7 +1194,7 @@ class EmployeeTicketsStatsAPI(DebugForce200Mixin, APIView):
                     return Response({"detail": "Authentication credentials were not provided."}, status=status.HTTP_200_OK)
                 return Response({"detail": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
             me = request.user.employee_profile
-            qs = qs.filter(Q(employee=me) | Q(assigned_to=me))
+            qs = qs.filter(Q(employee=me) | Q(assigned_to=me) | Q(assignees=me)).distinct()
 
         by_status = {
             "pending": qs.filter(status="open").count(),
@@ -1193,11 +1346,11 @@ class EmployeeTicketCommentsAPI(DebugForce200Mixin, APIView):
         if not ticket:
             return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
         if not getattr(request.user, "is_authenticated", False) and settings.DEBUG:
-            qs = EmployeeTicketComment.objects.filter(ticket=ticket).select_related("author", "author_employee", "author_employee__user").order_by("-created_at")
+            qs = EmployeeTicketComment.objects.filter(ticket=ticket).select_related("author", "author_employee", "author_employee__user").order_by("created_at")
             return Response(EmployeeTicketCommentSerializer(qs, many=True, context={"request": request}).data, status=status.HTTP_200_OK)
         if not _can_access_ticket(request.user, ticket):
             return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
-        qs = EmployeeTicketComment.objects.filter(ticket=ticket).select_related("author", "author_employee", "author_employee__user").order_by("-created_at")
+        qs = EmployeeTicketComment.objects.filter(ticket=ticket).select_related("author", "author_employee", "author_employee__user").order_by("created_at")
         return Response(EmployeeTicketCommentSerializer(qs, many=True, context={"request": request}).data, status=status.HTTP_200_OK)
 
     def post(self, request, pk):
@@ -1213,14 +1366,28 @@ class EmployeeTicketCommentsAPI(DebugForce200Mixin, APIView):
         if text is None:
             text = request.data.get("message", None)
         if not isinstance(text, str) or not text.strip():
+            text = ""
+
+        files = request.FILES.getlist("files") or request.FILES.getlist("attachments") or request.FILES.getlist("file")
+
+        if not text.strip() and not files:
             return Response({"detail": "text is required"}, status=status.HTTP_400_BAD_REQUEST)
 
         comment = EmployeeTicketComment.objects.create(
             ticket=ticket,
             author=request.user,
             author_employee=getattr(request.user, "employee_profile", None) if getattr(request.user, "is_authenticated", False) else None,
-            text=text.strip(),
+            text=text.strip() if isinstance(text, str) else "",
         )
+
+        for uploaded_file in files:
+            EmployeeTicketAttachment.objects.create(
+                ticket=ticket,
+                comment=comment,
+                file=uploaded_file,
+                file_name=getattr(uploaded_file, "name", "") or "upload",
+            )
+
         return Response(EmployeeTicketCommentSerializer(comment, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
@@ -1245,11 +1412,11 @@ class EmployeeTicketCommentsFlatAPI(DebugForce200Mixin, APIView):
             return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
         if not getattr(request.user, "is_authenticated", False) and settings.DEBUG:
-            qs = EmployeeTicketComment.objects.filter(ticket=ticket).select_related("author", "author_employee", "author_employee__user").order_by("-created_at")
+            qs = EmployeeTicketComment.objects.filter(ticket=ticket).select_related("author", "author_employee", "author_employee__user").order_by("created_at")
             return Response(EmployeeTicketCommentSerializer(qs, many=True, context={"request": request}).data, status=status.HTTP_200_OK)
         if not _can_access_ticket(request.user, ticket):
             return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
-        qs = EmployeeTicketComment.objects.filter(ticket=ticket).select_related("author", "author_employee", "author_employee__user").order_by("-created_at")
+        qs = EmployeeTicketComment.objects.filter(ticket=ticket).select_related("author", "author_employee", "author_employee__user").order_by("created_at")
         return Response(EmployeeTicketCommentSerializer(qs, many=True, context={"request": request}).data, status=status.HTTP_200_OK)
 
     def post(self, request):
@@ -1270,15 +1437,132 @@ class EmployeeTicketCommentsFlatAPI(DebugForce200Mixin, APIView):
         if text is None:
             text = request.data.get("message", None)
         if not isinstance(text, str) or not text.strip():
+            text = ""
+
+        files = request.FILES.getlist("files") or request.FILES.getlist("attachments") or request.FILES.getlist("file")
+
+        if not text.strip() and not files:
             return Response({"detail": "text is required"}, status=status.HTTP_400_BAD_REQUEST)
 
         comment = EmployeeTicketComment.objects.create(
             ticket=ticket,
             author=request.user,
             author_employee=getattr(request.user, "employee_profile", None) if getattr(request.user, "is_authenticated", False) else None,
-            text=text.strip(),
+            text=text.strip() if isinstance(text, str) else "",
         )
+
+        for uploaded_file in files:
+            EmployeeTicketAttachment.objects.create(
+                ticket=ticket,
+                comment=comment,
+                file=uploaded_file,
+                file_name=getattr(uploaded_file, "name", "") or "upload",
+            )
+
         return Response(EmployeeTicketCommentSerializer(comment, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class EmployeeTicketCommentDetailAPI(DebugForce200Mixin, APIView):
+    disable_force_200 = True
+    authentication_classes = [QuietJWTAuthentication, SessionAuthentication]
+    renderer_classes = [JSONRenderer, BrowsableAPIRenderer]
+    parser_classes = [JSONParser, FormParser, MultiPartParser]
+    permission_classes = [IsAuthenticated]
+
+    def get_object(self, pk, ticket_pk=None):
+        try:
+            qs = EmployeeTicketComment.objects.select_related(
+                "ticket",
+                "author",
+                "author_employee",
+                "author_employee__user",
+            )
+            if ticket_pk is not None:
+                return qs.get(pk=pk, ticket_id=ticket_pk)
+            return qs.get(pk=pk)
+        except EmployeeTicketComment.DoesNotExist:
+            return None
+
+    def get(self, request, pk, ticket_pk=None):
+        comment = self.get_object(pk, ticket_pk)
+        if not comment:
+            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+        if not _is_admin(request.user):
+            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+        return Response(
+            EmployeeTicketCommentSerializer(comment, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def patch(self, request, pk, ticket_pk=None):
+
+        comment = self.get_object(pk, ticket_pk)
+
+        if not comment:
+            return Response(
+                {"detail": "Not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not _can_modify_ticket_comment(request.user, comment):
+            return Response(
+                {"detail": "You can only edit your own comments on tickets assigned to you."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        text_value = request.data.get(
+            "text",
+            request.data.get(
+                "comment",
+                request.data.get("message")
+            ),
+        )
+
+        if text_value is None:
+            return Response(
+                {"detail": "text is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        text = str(text_value).strip()
+
+        if not text:
+            return Response(
+                {"detail": "text is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        comment.text = text
+        comment.save(update_fields=["text"])
+
+        return Response(
+            EmployeeTicketCommentSerializer(
+                comment,
+                context={"request": request}
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, pk, ticket_pk=None):
+        comment = self.get_object(pk, ticket_pk)
+
+        if not comment:
+            return Response(
+                {"detail": "Not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not _can_modify_ticket_comment(request.user, comment):
+            return Response(
+                {"detail": "You can only delete your own comments on tickets assigned to you."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        comment.delete()
+
+        return Response(
+            status=status.HTTP_204_NO_CONTENT
+        )
 
 
 class EmployeeMeAPI(DebugForce200Mixin, APIView):

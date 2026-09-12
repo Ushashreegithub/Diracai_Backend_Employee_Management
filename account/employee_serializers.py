@@ -144,94 +144,185 @@ class EmployeeProfileSerializer(serializers.ModelSerializer):
 
 class EmployeeLoginSerializer(serializers.Serializer):
     """
-    Serializer for employee login
-    Accepts either phone or email + password
+    Serializer for employee login.
+
+    Accepts:
+    - Email
+    - Phone
+    - Username
+    - Employee ID
     """
-    login_id = serializers.CharField()  # Can be email or phone
+    login_id = serializers.CharField()
     password = serializers.CharField(write_only=True)
 
     def validate(self, attrs):
-        """Validate employee login credentials"""
-        login_id = attrs.get('login_id')
+        login_id = (attrs.get('login_id') or '').strip()
         password = attrs.get('password')
 
-        # Try to find user by email or phone
-        try:
-            # First try to find by email
-            user = User.objects.get(email=login_id)
-        except User.DoesNotExist:
-            try:
-                # Then try by phone (through EmployeeProfile)
-                employee = EmployeeProfile.objects.get(phone=login_id)
+        if not login_id:
+            raise serializers.ValidationError(
+                'Email, phone, username, or employee ID is required.',
+                code='authorization'
+            )
+
+        user = None
+
+        # 1. Try email
+        user = User.objects.filter(
+            email__iexact=login_id
+        ).first()
+
+        # 2. Try username
+        if user is None:
+            user = User.objects.filter(
+                username__iexact=login_id
+            ).first()
+
+        # 3. Try phone from EmployeeProfile
+        if user is None:
+            employee = EmployeeProfile.objects.filter(
+                phone__iexact=login_id
+            ).select_related('user').first()
+
+            if employee:
                 user = employee.user
-            except EmployeeProfile.DoesNotExist:
-                msg = 'Unable to log in with provided credentials.'
-                raise serializers.ValidationError(msg, code='authorization')
+
+        # 4. Try employee ID
+        if user is None:
+            employee = EmployeeProfile.objects.filter(
+                employee_id__iexact=login_id
+            ).select_related('user').first()
+
+            if employee:
+                user = employee.user
+
+        # No matching user
+        if user is None:
+            raise serializers.ValidationError(
+                'Unable to log in with provided credentials.',
+                code='authorization'
+            )
 
         # Verify password
         if not user.check_password(password):
-            msg = 'Unable to log in with provided credentials.'
-            raise serializers.ValidationError(msg, code='authorization')
+            raise serializers.ValidationError(
+                'Unable to log in with provided credentials.',
+                code='authorization'
+            )
 
-        # Check if employee profile exists
-        if not hasattr(user, 'employee_profile'):
-            msg = 'This user is not an employee.'
-            raise serializers.ValidationError(msg, code='authorization')
+        # Check employee profile
+        employee_profile = getattr(user, 'employee_profile', None)
 
-        # Check if employee is active
-        if user.employee_profile.status == 'inactive':
-            msg = 'This employee account is inactive. Please contact admin.'
-            raise serializers.ValidationError(msg, code='authorization')
+        if employee_profile is None:
+            raise serializers.ValidationError(
+                'This user is not an employee.',
+                code='authorization'
+            )
+
+        # Check active status
+        if employee_profile.status != 'active':
+            raise serializers.ValidationError(
+                'This employee account is inactive. Please contact admin.',
+                code='inactive'
+            )
 
         attrs['user'] = user
+        attrs['employee'] = employee_profile
+
         return attrs
 
 
 class OTPSendSerializer(serializers.Serializer):
     """
-    Serializer to request OTP for employee
-    Returns phone number for OTP to be sent
+    Serializer to request OTP for employee.
+
+    Accepts:
+    - Email
+    - Phone
+    - Username
+    - Employee ID
     """
     login_id = serializers.CharField()
     password = serializers.CharField(write_only=True)
-    
+
     class Meta:
         fields = ['login_id', 'password']
 
     def validate(self, attrs):
-        """Validate credentials and get employee info"""
-        login_id = attrs.get('login_id')
+        login_id = (attrs.get('login_id') or '').strip()
         password = attrs.get('password')
 
-        # Try to find user by email or phone
-        try:
-            user = User.objects.get(email=login_id)
-        except User.DoesNotExist:
-            try:
-                employee = EmployeeProfile.objects.get(phone=login_id)
+        if not login_id:
+            raise serializers.ValidationError(
+                'Email, phone, username, or employee ID is required.',
+                code='not_found'
+            )
+
+        user = None
+
+        # 1. Email
+        user = User.objects.filter(
+            email__iexact=login_id
+        ).first()
+
+        # 2. Username
+        if user is None:
+            user = User.objects.filter(
+                username__iexact=login_id
+            ).first()
+
+        # 3. Phone
+        if user is None:
+            employee = EmployeeProfile.objects.filter(
+                phone__iexact=login_id
+            ).select_related('user').first()
+
+            if employee:
                 user = employee.user
-            except EmployeeProfile.DoesNotExist:
-                msg = 'Unable to find user with provided credentials.'
-                raise serializers.ValidationError(msg, code='not_found')
+
+        # 4. Employee ID
+        if user is None:
+            employee = EmployeeProfile.objects.filter(
+                employee_id__iexact=login_id
+            ).select_related('user').first()
+
+            if employee:
+                user = employee.user
+
+        # No user found
+        if user is None:
+            raise serializers.ValidationError(
+                'Unable to find user with provided credentials.',
+                code='not_found'
+            )
 
         # Verify password
         if not user.check_password(password):
-            msg = 'Invalid password.'
-            raise serializers.ValidationError(msg, code='invalid_password')
+            raise serializers.ValidationError(
+                'Invalid password.',
+                code='invalid_password'
+            )
 
-        # Check if employee profile exists
-        if not hasattr(user, 'employee_profile'):
-            msg = 'This user is not an employee.'
-            raise serializers.ValidationError(msg, code='not_employee')
+        # Employee profile
+        employee_profile = getattr(user, 'employee_profile', None)
 
-        # Check if employee is active
-        if user.employee_profile.status == 'inactive':
-            msg = 'This employee account is inactive.'
-            raise serializers.ValidationError(msg, code='inactive')
+        if employee_profile is None:
+            raise serializers.ValidationError(
+                'This user is not an employee.',
+                code='not_employee'
+            )
+
+        # Active status
+        if employee_profile.status != 'active':
+            raise serializers.ValidationError(
+                'This employee account is inactive.',
+                code='inactive'
+            )
 
         attrs['user'] = user
-        return attrs
+        attrs['employee'] = employee_profile
 
+        return attrs
 
 class OTPVerifySerializer(serializers.Serializer):
     """
@@ -1009,13 +1100,13 @@ from account.employee_models import (
     PrivateProjectPlan,
     PrivateProjectAssignment,
     PrivateProjectDailyUpdate,
+    PrivateProjectTicketAssignment,
     EmployeeTicket,
     EmployeeTicketAttachment,
     EmployeeTicketComment,
     EmployeeTicketAssignmentHistory,
     CurrentProjectTicketAssignment,
 )
-
 
 class LeaveRequestSerializer(serializers.ModelSerializer):
     employee_id = serializers.CharField(source='employee.employee_id', read_only=True)
@@ -1187,40 +1278,167 @@ class EmployeeTicketCommentSerializer(serializers.ModelSerializer):
     author = serializers.SerializerMethodField()
     author_name = serializers.SerializerMethodField()
     author_employee_id = serializers.SerializerMethodField()
+    attachments = serializers.SerializerMethodField()
+    can_edit = serializers.SerializerMethodField()
+    can_delete = serializers.SerializerMethodField()
 
     class Meta:
         model = EmployeeTicketComment
-        fields = ['id', 'ticket', 'text', 'author', 'author_name', 'author_employee_id', 'created_at']
-        read_only_fields = ['id', 'author', 'author_name', 'author_employee_id', 'created_at']
+        fields = [
+            'id',
+            'ticket',
+            'text',
+            'author',
+            'author_name',
+            'author_employee_id',
+            'attachments',
+            'can_edit',
+            'can_delete',
+            'created_at',
+        ]
+        read_only_fields = [
+            'id',
+            'author',
+            'author_name',
+            'author_employee_id',
+            'attachments',
+            'can_edit',
+            'can_delete',
+            'created_at',
+        ]
+
+    def _can_modify_comment(self, obj):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None) if request else None
+
+        if not user or not getattr(user, 'is_authenticated', False):
+            return False
+
+        # Admin can modify every comment.
+        if (
+            getattr(user, 'is_staff', False)
+            or getattr(user, 'is_superuser', False)
+            or getattr(user, 'is_admin', False)
+        ):
+            return True
+
+        employee = getattr(user, 'employee_profile', None)
+
+        if not employee:
+            return False
+
+        # Only the comment author can modify the comment.
+        author_matches = obj.author_id == user.id
+
+        if not author_matches:
+            author_employee = getattr(obj, 'author_employee', None)
+
+            author_matches = bool(
+                author_employee
+                and author_employee.user_id == user.id
+            )
+
+        if not author_matches:
+            return False
+
+        ticket = getattr(obj, 'ticket', None)
+
+        if not ticket:
+            return False
+
+        # Multi-assignee support.
+        try:
+            if ticket.assignees.filter(pk=employee.pk).exists():
+                return True
+        except Exception:
+            pass
+
+        # Backward compatibility with primary assignee.
+        return getattr(ticket, 'assigned_to_id', None) == employee.pk
+
+    def get_can_edit(self, obj):
+        return self._can_modify_comment(obj)
+
+    def get_can_delete(self, obj):
+        return self._can_modify_comment(obj)
 
     def get_author(self, obj):
         employee = getattr(obj, "author_employee", None)
         user = getattr(obj, "author", None)
+
         if employee:
             return {
                 "id": employee.id,
                 "name": _employee_label(employee),
-                "email": getattr(getattr(employee, "user", None), "email", "") or "",
-                "employee_id": getattr(employee, "employee_id", ""),
+                "email": getattr(
+                    getattr(employee, "user", None),
+                    "email",
+                    ""
+                ) or "",
+                "employee_id": getattr(
+                    employee,
+                    "employee_id",
+                    ""
+                ),
             }
+
         if user:
-            return {"id": user.id, "name": _user_label(user)}
+            return {
+                "id": user.id,
+                "name": _user_label(user),
+                "employee_id": str(user.id),
+            }
+
         return None
 
     def get_author_name(self, obj):
         employee = getattr(obj, "author_employee", None)
         user = getattr(obj, "author", None)
+
         if employee:
             return _employee_label(employee)
+
         if user:
             return _user_label(user)
+
         return "Unknown"
 
     def get_author_employee_id(self, obj):
         employee = getattr(obj, "author_employee", None)
+        user = getattr(obj, "author", None)
+
         if employee:
-            return getattr(employee, "employee_id", "") or ""
+            return getattr(
+                employee,
+                "employee_id",
+                ""
+            ) or ""
+
+        if user:
+            return str(user.id)
+
         return ""
+
+    def get_attachments(self, obj):
+        attachments = getattr(obj, "attachments", None)
+
+        if attachments is not None:
+            queryset = attachments.all()
+        else:
+            ticket = getattr(obj, "ticket", None)
+            queryset = (
+                ticket.attachments.filter(
+                    comment__isnull=True
+                ).all()
+                if ticket
+                else []
+            )
+
+        return EmployeeTicketAttachmentSerializer(
+            queryset,
+            many=True,
+            context=self.context
+        ).data
 
 
 class EmployeeTicketAssignmentHistorySerializer(serializers.ModelSerializer):
@@ -1256,6 +1474,8 @@ class EmployeeTicketListSerializer(serializers.ModelSerializer):
     employee = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
     assigned_to = serializers.SerializerMethodField()
+    assigned_to_ids = serializers.SerializerMethodField()
+    assignees = serializers.SerializerMethodField()
     assigned_by = serializers.SerializerMethodField()
     can_reassign = serializers.SerializerMethodField()
 
@@ -1266,12 +1486,15 @@ class EmployeeTicketListSerializer(serializers.ModelSerializer):
             'ticket_number',
             'employee',
             'title',
+            'description',
             'status',
             'priority',
             'category',
             'created_at',
             'updated_at',
             'assigned_to',
+            'assigned_to_ids',
+            'assignees',
             'assigned_by',
             'assigned_at',
             'can_reassign',
@@ -1293,6 +1516,27 @@ class EmployeeTicketListSerializer(serializers.ModelSerializer):
             return None
         return {"id": e.id, "name": _employee_label(e), "email": getattr(getattr(e, "user", None), "email", "") or "", "employee_code": getattr(e, "employee_id", "")}
 
+    def get_assigned_to_ids(self, obj):
+        ids = list(obj.assignees.values_list("id", flat=True))
+        if not ids and obj.assigned_to_id:
+            ids = [obj.assigned_to_id]
+        return ids
+
+    def get_assignees(self, obj):
+        employees = list(obj.assignees.select_related("user").all())
+        if not employees and obj.assigned_to:
+            employees = [obj.assigned_to]
+
+        return [
+            {
+                "id": employee.id,
+                "name": _employee_label(employee),
+                "email": getattr(getattr(employee, "user", None), "email", "") or "",
+                "employee_code": getattr(employee, "employee_id", ""),
+            }
+            for employee in employees
+        ]
+
     def get_assigned_by(self, obj):
         u = getattr(obj, "assigned_by", None)
         if not u:
@@ -1309,9 +1553,24 @@ class EmployeeTicketDetailSerializer(serializers.ModelSerializer):
     status = serializers.CharField(required=False)
     employee_info = serializers.SerializerMethodField()
     assigned_to = serializers.SerializerMethodField()
+    assigned_to_ids = serializers.SerializerMethodField()
+    assignees = serializers.SerializerMethodField()
     assigned_by = serializers.SerializerMethodField()
     created_by = serializers.SerializerMethodField()
-    employee = serializers.PrimaryKeyRelatedField(queryset=EmployeeProfile.objects.all(), required=True)
+    project = serializers.SerializerMethodField()
+    project_assignments = serializers.SerializerMethodField()   
+
+    employee = serializers.PrimaryKeyRelatedField(
+        queryset=EmployeeProfile.objects.all(),
+        required=True,
+    )
+
+    project_id = serializers.IntegerField(   
+        required=False,
+        allow_null=True,
+        write_only=True,
+    )
+
     assigned_to_id = serializers.PrimaryKeyRelatedField(
         source="assigned_to",
         queryset=EmployeeProfile.objects.all(),
@@ -1319,7 +1578,22 @@ class EmployeeTicketDetailSerializer(serializers.ModelSerializer):
         required=False,
         write_only=True,
     )
-    reason = serializers.CharField(required=False, allow_blank=True, write_only=True)
+
+    # Canonical multi-assignee write field.
+    assignee_ids = serializers.PrimaryKeyRelatedField(
+        source="assignees",
+        queryset=EmployeeProfile.objects.all(),
+        many=True,
+        required=False,
+        write_only=True,
+    )
+
+    reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        write_only=True,
+    )
+
     ticket_number = serializers.CharField(read_only=True)
     attachments = EmployeeTicketAttachmentSerializer(many=True, read_only=True)
     assignment_history = EmployeeTicketAssignmentHistorySerializer(many=True, read_only=True)
@@ -1328,51 +1602,200 @@ class EmployeeTicketDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = EmployeeTicket
         fields = [
-            'id',
-            'ticket_number',
-            'employee',
-            'employee_info',
-            'title',
-            'description',
-            'status',
-            'priority',
-            'category',
-            'created_by',
-            'assigned_to',
-            'assigned_to_id',
-            'reason',
-            'assigned_by',
-            'assigned_at',
-            'attachments',
-            'assignment_history',
-            'comments',
-            'created_at',
-            'updated_at',
+            "id",
+            "ticket_number",
+            "employee",
+            "employee_info",
+            "title",
+            "description",
+            "status",
+            "priority",
+            "category",
+            "created_by",
+            "assigned_to",
+            "assigned_to_id",
+            "assignee_ids",
+            "assigned_to_ids",
+            "assignees",
+            "reason",
+            "assigned_by",
+            "assigned_at",
+            "attachments",
+            "assignment_history",
+            "comments",
+            "created_at",
+            "updated_at",
+            "project",
+            "project_id",
+            "project_assignments",
         ]
-        read_only_fields = ['id', 'ticket_number', 'created_at', 'updated_at', 'created_by', 'assigned_by', 'assigned_at', 'attachments', 'assignment_history']
+        read_only_fields = [
+            "id",
+            "ticket_number",
+            "created_at",
+            "updated_at",
+            "created_by",
+            "assigned_by",
+            "assigned_at",
+            "attachments",
+            "assignment_history",
+            "assigned_to_ids",
+            "assignees",
+        ]
 
     def validate_status(self, value):
         return _ticket_status_from_api(value)
 
+    def _set_assignment_state(self, instance, employees, user, reason, old_ids=None, old_primary=None):
+        employees = list(employees or [])
+        new_ids = {employee.id for employee in employees}
+        old_ids = set(old_ids or [])
+
+        instance.assignees.set(employees)
+        instance.assigned_to = employees[0] if employees else None
+        instance.assigned_by = user if employees else None
+        instance.assigned_at = timezone.now() if employees else None
+        instance.save(
+            update_fields=[
+                "assigned_to",
+                "assigned_by",
+                "assigned_at",
+                "updated_at",
+            ]
+        )
+
+        for employee in employees:
+            if employee.id not in old_ids:
+                EmployeeTicketAssignmentHistory.objects.create(
+                    ticket=instance,
+                    from_employee=old_primary,
+                    to_employee=employee,
+                    by=user,
+                    reason=reason,
+                )
+
     def create(self, validated_data):
         reason = str(validated_data.pop("reason", "") or "").strip()
+        project_id = validated_data.pop("project_id", None)
+
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
 
-        assigned_to = validated_data.get("assigned_to", None)
+        # assignee_ids is mapped to "assignees" by source="assignees".
+        assignee_candidates = validated_data.pop("assignees", None)
+
+        # Backward-compatible single-assignee creation.
+        if (
+            assignee_candidates is None
+            and validated_data.get("assigned_to") is not None
+        ):
+            assignee_candidates = [validated_data.get("assigned_to")]
+
+        assigned_to = validated_data.get("assigned_to")
+        employees = list(assignee_candidates or [])
+
+        # ---------------------------------------------------------
+        # Resolve the selected project plan.
+        # ---------------------------------------------------------
+        private_plan = None
+        current_plan = None
+
+        if project_id not in (None, "", "null"):
+            try:
+                private_plan = (
+                    PrivateProjectPlan.objects
+                    .filter(project_id=int(project_id))
+                    .first()
+                )
+            except (ValueError, TypeError):
+                private_plan = None
+
+            if private_plan is None:
+                try:
+                    current_plan = (
+                        CurrentProjectPlan.objects
+                        .filter(project_id=int(project_id))
+                        .first()
+                    )
+                except (ValueError, TypeError):
+                    current_plan = None
+
+            if private_plan is None and current_plan is None:
+                raise serializers.ValidationError({
+                    "project_id": "Selected project does not have a project plan."
+                })
+
+            plan = private_plan or current_plan
+
+            # Only employees already assigned to the selected project
+            # can receive a project ticket.
+            project_employee_ids = set(
+                plan.assignments.values_list("employee_id", flat=True)
+            )
+
+            invalid_employees = [
+                employee.id
+                for employee in employees
+                if employee.id not in project_employee_ids
+            ]
+
+            if invalid_employees:
+                raise serializers.ValidationError({
+                    "assignee_ids":
+                        "One or more selected employees are not assigned to this project."
+                })
+
+            if not employees:
+                raise serializers.ValidationError({
+                    "assignee_ids":
+                        "Please select at least one employee for the project ticket."
+                })
+
+            # EmployeeTicket still requires one employee. Use the first
+            # selected project employee as the primary employee.
+            validated_data["employee"] = employees[0]
+
+        # ---------------------------------------------------------
+        # Create ticket.
+        # ---------------------------------------------------------
         instance = super().create(validated_data)
 
-        if assigned_to is not None:
-            instance.assigned_by = user
-            instance.assigned_at = timezone.now()
-            instance.save(update_fields=["assigned_by", "assigned_at", "updated_at"])
-            EmployeeTicketAssignmentHistory.objects.create(
-                ticket=instance,
-                from_employee=None,
-                to_employee=assigned_to,
-                by=user,
-                reason=reason,
+        # ---------------------------------------------------------
+        # Keep the existing normal ticket assignment workflow.
+        # ---------------------------------------------------------
+        if employees:
+            self._set_assignment_state(
+                instance,
+                employees,
+                user,
+                reason,
             )
+        elif assigned_to is not None:
+            self._set_assignment_state(
+                instance,
+                [assigned_to],
+                user,
+                reason,
+            )
+
+        # ---------------------------------------------------------
+        # Link project -> ticket -> employee using existing bridge models.
+        # ---------------------------------------------------------
+        if project_id not in (None, "", "null"):
+            if private_plan is not None:
+                for employee in employees:
+                    PrivateProjectTicketAssignment.objects.get_or_create(
+                        plan=private_plan,
+                        employee=employee,
+                        ticket=instance,
+                    )
+            elif current_plan is not None:
+                for employee in employees:
+                    CurrentProjectTicketAssignment.objects.get_or_create(
+                        plan=current_plan,
+                        employee=employee,
+                        ticket=instance,
+                    )
 
         return instance
 
@@ -1381,20 +1804,24 @@ class EmployeeTicketDetailSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
 
-        old_assigned_to = getattr(instance, "assigned_to", None)
-        instance = super().update(instance, validated_data)
-        new_assigned_to = getattr(instance, "assigned_to", None)
+        assignee_candidates = validated_data.pop("assignees", None)
+        old_ids = list(instance.assignees.values_list("id", flat=True))
+        old_primary = getattr(instance, "assigned_to", None)
 
-        if old_assigned_to != new_assigned_to:
-            instance.assigned_by = user
-            instance.assigned_at = timezone.now()
-            instance.save(update_fields=["assigned_to", "assigned_by", "assigned_at", "updated_at"])
-            EmployeeTicketAssignmentHistory.objects.create(
-                ticket=instance,
-                from_employee=old_assigned_to,
-                to_employee=new_assigned_to,
-                by=user,
-                reason=reason,
+        # If an old client only sends assigned_to_id, keep it synchronized with M2M.
+        if assignee_candidates is None and "assigned_to" in validated_data:
+            assignee_candidates = [validated_data.get("assigned_to")] if validated_data.get("assigned_to") else []
+
+        instance = super().update(instance, validated_data)
+
+        if assignee_candidates is not None:
+            self._set_assignment_state(
+                instance,
+                assignee_candidates,
+                user,
+                reason,
+                old_ids=old_ids,
+                old_primary=old_primary,
             )
 
         return instance
@@ -1408,13 +1835,44 @@ class EmployeeTicketDetailSerializer(serializers.ModelSerializer):
         e = getattr(obj, "employee", None)
         if not e:
             return None
-        return {"id": e.id, "name": _employee_label(e), "email": getattr(getattr(e, "user", None), "email", "") or "", "employee_code": getattr(e, "employee_id", "")}
+        return {
+            "id": e.id,
+            "name": _employee_label(e),
+            "email": getattr(getattr(e, "user", None), "email", "") or "",
+            "employee_code": getattr(e, "employee_id", ""),
+        }
 
     def get_assigned_to(self, obj):
         e = getattr(obj, "assigned_to", None)
         if not e:
             return None
-        return {"id": e.id, "name": _employee_label(e), "email": getattr(getattr(e, "user", None), "email", "") or "", "employee_code": getattr(e, "employee_id", "")}
+        return {
+            "id": e.id,
+            "name": _employee_label(e),
+            "email": getattr(getattr(e, "user", None), "email", "") or "",
+            "employee_code": getattr(e, "employee_id", ""),
+        }
+
+    def get_assigned_to_ids(self, obj):
+        ids = list(obj.assignees.values_list("id", flat=True))
+        if not ids and obj.assigned_to_id:
+            ids = [obj.assigned_to_id]
+        return ids
+
+    def get_assignees(self, obj):
+        employees = list(obj.assignees.select_related("user").all())
+        if not employees and obj.assigned_to:
+            employees = [obj.assigned_to]
+
+        return [
+            {
+                "id": employee.id,
+                "name": _employee_label(employee),
+                "email": getattr(getattr(employee, "user", None), "email", "") or "",
+                "employee_code": getattr(employee, "employee_id", ""),
+            }
+            for employee in employees
+        ]
 
     def get_assigned_by(self, obj):
         u = getattr(obj, "assigned_by", None)
@@ -1427,6 +1885,95 @@ class EmployeeTicketDetailSerializer(serializers.ModelSerializer):
         if not u:
             return None
         return {"id": u.id, "name": _user_label(u)}
+
+    def get_project(self, obj):
+
+        private_assignment = (
+
+            obj.private_plan_assignments
+            .select_related("plan__project")
+            .first()
+        )
+
+        if private_assignment:
+            project = private_assignment.plan.project
+
+            return {
+                "id": project.id,
+                "name": (
+                    private_assignment.plan.project_name
+                    or getattr(project, "title", "")
+                    or getattr(project, "name", "")
+                ),
+            }
+
+        current_assignment = (
+            obj.plan_assignments
+            .select_related("plan__project")
+            .first()
+        )
+
+        if current_assignment:
+            project = current_assignment.plan.project
+
+            return {
+                "id": project.id,
+                "name": (
+                    current_assignment.plan.project_name
+                    or getattr(project, "title", "")
+                    or getattr(project, "name", "")
+                ),
+            }
+
+        return None
+
+
+    def get_project_assignments(self, obj):
+        result = []
+
+        private_assignments = (
+            obj.private_plan_assignments
+            .select_related("employee__user", "plan__project")
+            .all()
+        )
+
+        for assignment in private_assignments:
+            result.append({
+                "id": assignment.id,
+                "project_id": assignment.plan.project_id,
+                "employee_id": assignment.employee_id,
+                "employee_code": getattr(
+                    assignment.employee,
+                    "employee_id",
+                    "",
+                ),
+                "employee_name": _employee_label(
+                    assignment.employee
+                ),
+            })
+
+        current_assignments = (
+            obj.plan_assignments
+            .select_related("employee__user", "plan__project")
+            .all()
+        )
+
+        for assignment in current_assignments:
+            result.append({
+                "id": assignment.id,
+                "project_id": assignment.plan.project_id,
+                "employee_id": assignment.employee_id,
+                "employee_code": getattr(
+                    assignment.employee,
+                    "employee_id",
+                    "",
+                ),
+                "employee_name": _employee_label(
+                    assignment.employee
+                ),
+            })
+
+        return result
 
 
 class PrivateProjectDailyUpdateSerializer(serializers.ModelSerializer):
@@ -1467,35 +2014,467 @@ class PrivateProjectAssignmentSerializer(serializers.ModelSerializer):
         return _employee_label(e)
 
 
+class PrivateProjectTicketAssignmentSerializer(serializers.ModelSerializer):
+    employee = serializers.PrimaryKeyRelatedField(
+        queryset=EmployeeProfile.objects.all(),
+        required=True,
+    )
+
+    employee_id = serializers.CharField(
+        source="employee.employee_id",
+        read_only=True,
+    )
+
+    ticket = serializers.PrimaryKeyRelatedField(
+        queryset=EmployeeTicket.objects.all(),
+        required=True,
+    )
+
+    ticket_number = serializers.CharField(
+        source="ticket.ticket_number",
+        read_only=True,
+    )
+
+    ticket_title = serializers.CharField(
+        source="ticket.title",
+        read_only=True,
+    )
+
+    ticket_status = serializers.CharField(
+        source="ticket.status",
+        read_only=True,
+    )
+
+    ticket_priority = serializers.CharField(
+        source="ticket.priority",
+        read_only=True,
+    )
+
+    employee_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PrivateProjectTicketAssignment
+
+        fields = [
+            "id",
+            "ticket",
+            "ticket_number",
+            "ticket_title",
+            "ticket_status",
+            "ticket_priority",
+            "employee",
+            "employee_id",
+            "employee_name",
+            "assign_date",
+            "expire_date",
+        ]
+
+        read_only_fields = [
+            "id",
+            "employee_id",
+            "ticket_number",
+            "ticket_title",
+            "ticket_status",
+            "ticket_priority",
+            "employee_name",
+        ]
+
+    def get_employee_name(self, obj):
+        employee = getattr(obj, "employee", None)
+
+        if not employee:
+            return ""
+
+        return _employee_label(employee)
+
+
 class PrivateProjectPlanSerializer(serializers.ModelSerializer):
-    employees = PrivateProjectAssignmentSerializer(source='assignments', many=True, required=False)
-    assignments = PrivateProjectAssignmentSerializer(many=True, required=False)
+    employees = PrivateProjectAssignmentSerializer(
+        source="assignments",
+        many=True,
+        required=False,
+    )
+
+    assignments = PrivateProjectAssignmentSerializer(
+        many=True,
+        required=False,
+    )
+
+    ticket_assignments = PrivateProjectTicketAssignmentSerializer(
+        many=True,
+        required=False,
+    )
+
+    tickets = serializers.SerializerMethodField()
 
     class Meta:
         model = PrivateProjectPlan
+
         fields = [
-            'id',
-            'project',
-            'start_date',
-            'end_date',
-            'timeline',
-            'project_name',
-            'project_description',
-            'employees',
-            'assignments',
-            'updated_at',
+            "id",
+            "project",
+            "start_date",
+            "end_date",
+            "timeline",
+            "project_name",
+            "project_description",
+            "employees",
+            "assignments",
+            "ticket_assignments",
+            "tickets",
+            "updated_at",
         ]
-        read_only_fields = ['id', 'updated_at']
+
+        read_only_fields = [
+            "id",
+            "tickets",
+            "updated_at",
+        ]
+
+    def get_tickets(self, obj):
+        if not obj:
+            return []
+        ticket_ids = list(
+            obj.ticket_assignments.values_list("ticket_id", flat=True).distinct()
+        )
+        if not ticket_ids:
+            return []
+        from account.employee_models import EmployeeTicket
+        tickets_qs = (
+            EmployeeTicket.objects.filter(pk__in=ticket_ids)
+            .select_related("assigned_to", "assigned_to__user", "employee", "employee__user")
+            .prefetch_related("assignees", "assignees__user")
+            .order_by("-created_at")
+        )
+        def _emp_info(ep):
+            if not ep:
+                return None
+            return {
+                "id": ep.id,
+                "name": _employee_label(ep),
+                "employee_code": getattr(ep, "employee_id", ""),
+            }
+
+        return [
+            {
+                "id": t.pk,
+                "ticket_number": t.ticket_number or "",
+                "title": t.title or "",
+                "description": t.description or "",
+                "status": t.status or "",
+                "priority": t.priority or "",
+                "employee": _emp_info(t.employee),
+                "assigned_to": _emp_info(t.assigned_to),
+                "assignees": [
+                    {
+                        "id": e.id,
+                        "name": _employee_label(e),
+                        "employee_code": getattr(e, "employee_id", ""),
+                    }
+                    for e in (list(t.assignees.all()) or ([t.assigned_to] if t.assigned_to else []))
+                ],
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+            }
+            for t in tickets_qs
+        ]
+
 
     def update(self, instance, validated_data):
-        validated_data.pop('assignments', None)
-        validated_data.pop('employees', None)
+        assignments_payload = validated_data.pop(
+            "assignments",
+            None,
+        )
+
+        validated_data.pop(
+            "employees",
+            None,
+        )
+
+        ticket_assignments_payload = validated_data.pop(
+            "ticket_assignments",
+            None,
+        )
+
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
+
         instance.save()
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+
+        is_admin = bool(
+            user
+            and getattr(user, "is_authenticated", False)
+            and (
+                getattr(user, "is_staff", False)
+                or getattr(user, "is_superuser", False)
+                or getattr(user, "is_admin", False)
+            )
+        )
+
+        # ---------------------------------------------------------
+        # PROJECT EMPLOYEE ASSIGNMENTS
+        # ---------------------------------------------------------
+
+        if assignments_payload is not None:
+            keep_assignment_ids = []
+
+            for row in assignments_payload:
+                if not isinstance(row, dict):
+                    continue
+
+                employee = row.get("employee")
+
+                if employee in (None, "", "null"):
+                    continue
+
+                employee_obj = (
+                    employee
+                    if isinstance(employee, EmployeeProfile)
+                    else None
+                )
+
+                if employee_obj is None:
+                    try:
+                        employee_obj = EmployeeProfile.objects.get(
+                            pk=int(
+                                getattr(
+                                    employee,
+                                    "pk",
+                                    employee,
+                                )
+                            )
+                        )
+                    except Exception:
+                        continue
+
+                assignment_id = row.get("id")
+
+                assignment = None
+
+                if assignment_id not in (
+                    None,
+                    "",
+                    "null",
+                ):
+                    try:
+                        assignment = (
+                            PrivateProjectAssignment.objects
+                            .filter(
+                                plan=instance,
+                                pk=int(assignment_id),
+                            )
+                            .first()
+                        )
+                    except Exception:
+                        assignment = None
+
+                if assignment is None:
+                    assignment, _ = (
+                        PrivateProjectAssignment.objects
+                        .get_or_create(
+                            plan=instance,
+                            employee=employee_obj,
+                        )
+                    )
+
+                for field in [
+                    "designation",
+                    "start_date",
+                    "end_date",
+                    "work",
+                    "status",
+                    "admin_comment",
+                    "employee_comment",
+                ]:
+                    if field in row:
+                        setattr(
+                            assignment,
+                            field,
+                            row.get(field),
+                        )
+
+                assignment.save()
+                keep_assignment_ids.append(
+                    assignment.id
+                )
+
+            (
+                PrivateProjectAssignment.objects
+                .filter(plan=instance)
+                .exclude(id__in=keep_assignment_ids)
+                .delete()
+            )
+
+        # ---------------------------------------------------------
+        # PROJECT TICKET ASSIGNMENTS
+        # ---------------------------------------------------------
+
+        if is_admin and ticket_assignments_payload is not None:
+
+            if not isinstance(
+                ticket_assignments_payload,
+                list,
+            ):
+                raise serializers.ValidationError(
+                    {
+                        "ticket_assignments":
+                            "Expected a list."
+                    }
+                )
+
+            keep_ticket_assignment_ids = []
+
+            for row in ticket_assignments_payload:
+
+                if not isinstance(row, dict):
+                    continue
+
+                ticket = row.get("ticket")
+                employee = row.get("employee")
+
+                if ticket in (
+                    None,
+                    "",
+                    "null",
+                ):
+                    continue
+
+                if employee in (
+                    None,
+                    "",
+                    "null",
+                ):
+                    continue
+
+                # Resolve ticket
+                ticket_obj = (
+                    ticket
+                    if isinstance(ticket, EmployeeTicket)
+                    else None
+                )
+
+                if ticket_obj is None:
+                    try:
+                        ticket_obj = (
+                            EmployeeTicket.objects
+                            .get(
+                                pk=int(
+                                    getattr(
+                                        ticket,
+                                        "pk",
+                                        ticket,
+                                    )
+                                )
+                            )
+                        )
+                    except Exception:
+                        continue
+
+                # Resolve employee
+                employee_obj = (
+                    employee
+                    if isinstance(
+                        employee,
+                        EmployeeProfile,
+                    )
+                    else None
+                )
+
+                if employee_obj is None:
+                    try:
+                        employee_obj = (
+                            EmployeeProfile.objects
+                            .get(
+                                pk=int(
+                                    getattr(
+                                        employee,
+                                        "pk",
+                                        employee,
+                                    )
+                                )
+                            )
+                        )
+                    except Exception:
+                        continue
+
+                # IMPORTANT:
+                # Employee must belong to this project.
+                if not (
+                    PrivateProjectAssignment.objects
+                    .filter(
+                        plan=instance,
+                        employee=employee_obj,
+                    )
+                    .exists()
+                ):
+                    raise serializers.ValidationError(
+                        {
+                            "ticket_assignments":
+                                f"Employee {employee_obj.employee_id} "
+                                f"is not assigned to this project."
+                        }
+                    )
+
+                assignment_id = row.get("id")
+
+                ticket_assignment = None
+
+                if assignment_id not in (
+                    None,
+                    "",
+                    "null",
+                ):
+                    try:
+                        ticket_assignment = (
+                            PrivateProjectTicketAssignment.objects
+                            .filter(
+                                plan=instance,
+                                pk=int(assignment_id),
+                            )
+                            .first()
+                        )
+                    except Exception:
+                        ticket_assignment = None
+
+                if ticket_assignment is None:
+                    ticket_assignment, _ = (
+                        PrivateProjectTicketAssignment.objects
+                        .get_or_create(
+                            plan=instance,
+                            employee=employee_obj,
+                            ticket=ticket_obj,
+                        )
+                    )
+
+                if "assign_date" in row:
+                    ticket_assignment.assign_date = (
+                        row.get("assign_date")
+                    )
+
+                if "expire_date" in row:
+                    ticket_assignment.expire_date = (
+                        row.get("expire_date")
+                    )
+
+                ticket_assignment.save()
+
+                keep_ticket_assignment_ids.append(
+                    ticket_assignment.id
+                )
+
+            (
+                PrivateProjectTicketAssignment.objects
+                .filter(plan=instance)
+                .exclude(
+                    id__in=keep_ticket_assignment_ids
+                )
+                .delete()
+            )
+
         return instance
-
-
+    
 class CurrentProjectDailyUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = CurrentProjectDailyUpdate
@@ -1537,42 +2516,115 @@ class CurrentProjectAssignmentSerializer(serializers.ModelSerializer):
 class CurrentProjectTicketAssignmentSerializer(serializers.ModelSerializer):
     employee = serializers.PrimaryKeyRelatedField(queryset=EmployeeProfile.objects.all(), required=True)
     employee_id = serializers.CharField(source='employee.employee_id', read_only=True)
+    employee_name = serializers.SerializerMethodField()
     ticket = serializers.PrimaryKeyRelatedField(queryset=EmployeeTicket.objects.all(), required=True)
+    ticket_number = serializers.CharField(source='ticket.ticket_number', read_only=True)
+    ticket_title = serializers.CharField(source='ticket.title', read_only=True)
+    ticket_status = serializers.CharField(source='ticket.status', read_only=True)
+    ticket_priority = serializers.CharField(source='ticket.priority', read_only=True)
 
     class Meta:
         model = CurrentProjectTicketAssignment
         fields = [
             'id',
             'ticket',
+            'ticket_number',
+            'ticket_title',
+            'ticket_status',
+            'ticket_priority',
             'employee',
             'employee_id',
+            'employee_name',
             'assign_date',
             'expire_date',
         ]
-        read_only_fields = ['id', 'employee_id']
+        read_only_fields = [
+            'id',
+            'employee_id',
+            'ticket_number',
+            'ticket_title',
+            'ticket_status',
+            'ticket_priority',
+            'employee_name',
+        ]
+
+    def get_employee_name(self, obj):
+        e = getattr(obj, "employee", None)
+        if not e:
+            return ""
+        return _employee_label(e)
 
 
 class CurrentProjectPlanSerializer(serializers.ModelSerializer):
     employees = CurrentProjectAssignmentSerializer(source='assignments', many=True, required=False)
     assignments = CurrentProjectAssignmentSerializer(many=True, required=False)
     ticket_assignments = CurrentProjectTicketAssignmentSerializer(many=True, required=False)
+    tickets = serializers.SerializerMethodField()
 
     class Meta:
         model = CurrentProjectPlan
         fields = [
-            'id',
-            'project',
-            'start_date',
-            'end_date',
-            'timeline',
-            'project_name',
-            'project_description',
-            'employees',
-            'assignments',
-            'ticket_assignments',
-            'updated_at',
+            "id",
+            "project",
+            "start_date",
+            "end_date",
+            "timeline",
+            "project_name",
+            "project_description",
+            "employees",
+            "assignments",
+            "ticket_assignments",
+            "tickets",
+            "updated_at",
         ]
-        read_only_fields = ['id', 'updated_at']
+        read_only_fields = ['id', 'tickets', 'updated_at']
+
+    def get_tickets(self, obj):
+        if not obj:
+            return []
+        ticket_ids = list(
+            obj.ticket_assignments.values_list("ticket_id", flat=True).distinct()
+        )
+        if not ticket_ids:
+            return []
+        from account.employee_models import EmployeeTicket
+        tickets_qs = (
+            EmployeeTicket.objects.filter(pk__in=ticket_ids)
+            .select_related("assigned_to", "assigned_to__user", "employee", "employee__user")
+            .prefetch_related("assignees", "assignees__user")
+            .order_by("-created_at")
+        )
+        def _emp_info(ep):
+            if not ep:
+                return None
+            return {
+                "id": ep.id,
+                "name": _employee_label(ep),
+                "employee_code": getattr(ep, "employee_id", ""),
+            }
+
+        return [
+            {
+                "id": t.pk,
+                "ticket_number": t.ticket_number or "",
+                "title": t.title or "",
+                "description": t.description or "",
+                "status": t.status or "",
+                "priority": t.priority or "",
+                "employee": _emp_info(t.employee),
+                "assigned_to": _emp_info(t.assigned_to),
+                "assignees": [
+                    {
+                        "id": e.id,
+                        "name": _employee_label(e),
+                        "employee_code": getattr(e, "employee_id", ""),
+                    }
+                    for e in (list(t.assignees.all()) or ([t.assigned_to] if t.assigned_to else []))
+                ],
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+            }
+            for t in tickets_qs
+        ]
 
     def update(self, instance, validated_data):
         assignments_payload = validated_data.pop('assignments', None)

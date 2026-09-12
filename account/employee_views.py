@@ -150,7 +150,7 @@ def _attach_fallback_otp(response_data, otp_code, email_sent, sms_sent):
     return response_data
 
 
-class EmployeeLoginRequestView(DebugForce200Mixin, APIView):
+class EmployeeLoginRequestView(APIView):
     """
     Step 1: Employee enters email/phone and password
     Returns: Phone number masked (for security) and employee details
@@ -223,7 +223,7 @@ class EmployeeLoginRequestView(DebugForce200Mixin, APIView):
         return Response(response_data, status=status.HTTP_200_OK)
 
 
-class EmployeeOTPVerifyView(DebugForce200Mixin, APIView):
+class EmployeeOTPVerifyView(APIView):
     """
     Step 2: Employee enters OTP
     Returns: JWT tokens for authenticated user
@@ -289,7 +289,7 @@ class EmployeeOTPVerifyView(DebugForce200Mixin, APIView):
         return response
 
 
-class EmployeeLoginView(DebugForce200Mixin, APIView):
+class EmployeeLoginView(APIView):
     """
     DEPRECATED: Old login endpoint (kept for backward compatibility)
     Use EmployeeLoginRequestView + EmployeeOTPVerifyView instead
@@ -300,8 +300,25 @@ class EmployeeLoginView(DebugForce200Mixin, APIView):
         serializer = EmployeeLoginSerializer(data=request.data)
 
         if not serializer.is_valid():
+            for field_errors in serializer.errors.values():
+                for err in (field_errors if isinstance(field_errors, list) else [field_errors]):
+                    code = getattr(err, "code", None)
+                    if code == "inactive":
+                        return Response(
+                            {"detail": "Pending admin approval"},
+                            status=status.HTTP_403_FORBIDDEN,
+                        )
+
+            detail = ""
+            if "non_field_errors" in serializer.errors:
+                err_list = serializer.errors["non_field_errors"]
+                detail = err_list[0] if isinstance(err_list, list) and err_list else str(err_list)
+            elif serializer.errors:
+                first_val = next(iter(serializer.errors.values()))
+                detail = first_val[0] if isinstance(first_val, list) and first_val else str(first_val)
+
             return Response(
-                serializer.errors,
+                {"detail": detail or "Unable to log in with provided credentials.", "errors": serializer.errors},
                 status=status.HTTP_400_BAD_REQUEST
             )
 

@@ -169,7 +169,21 @@ class EmployeeTicket(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='open')
     priority = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default='medium')
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='created_employee_tickets')
-    assigned_to = models.ForeignKey(EmployeeProfile, on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_tickets')
+    assigned_to = models.ForeignKey(
+        EmployeeProfile,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='assigned_tickets'
+    )
+
+    # Supports multiple assignees while keeping assigned_to
+    # for backward compatibility with existing data/APIs.
+    assignees = models.ManyToManyField(
+        EmployeeProfile,
+        blank=True,
+        related_name='assigned_tickets_many'
+    )
     assigned_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_employee_tickets')
     assigned_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -209,6 +223,13 @@ class EmployeeTicketAssignmentHistory(models.Model):
 
 class EmployeeTicketAttachment(models.Model):
     ticket = models.ForeignKey(EmployeeTicket, on_delete=models.CASCADE, related_name='attachments')
+    comment = models.ForeignKey(
+    'EmployeeTicketComment',
+    on_delete=models.CASCADE,
+    null=True,
+    blank=True,
+    related_name='attachments',
+)
     file = models.FileField(upload_to='employee-ticket-attachments/')
     file_name = models.CharField(max_length=255, blank=True)
     uploaded_at = models.DateTimeField(auto_now_add=True)
