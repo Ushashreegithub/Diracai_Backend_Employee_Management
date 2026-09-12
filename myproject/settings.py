@@ -122,9 +122,15 @@ DATABASES = {
         'USER': 'diracai',
         'PASSWORD': '1234',
         'HOST': '127.0.0.1',   # IMPORTANT
-        'PORT': '5432',
+        'PORT': '5433',
     } 
 }
+# from account.employee_models import EmployeeProfile, EmployeeTicket
+# from account import Project
+
+# print("Employees:", EmployeeProfile.objects.count())
+# print("Projects:", Project.objects.count())
+# print("Tickets:", EmployeeTicket.objects.count())
 
 
 

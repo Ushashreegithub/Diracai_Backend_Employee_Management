@@ -200,12 +200,14 @@ class AdminDashboardAPI(APIView):
             return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
         
         return Response({
-            "msg": "ok", 
+            "msg": "ok",
             "user": {
                 "id": request.user.id,
                 "username": request.user.username,
                 "email": request.user.email,
                 "phoneno": request.user.phoneno,
+                "is_staff": request.user.is_staff,
+                "is_superuser": request.user.is_superuser,
             }
         })
 

@@ -48,6 +48,7 @@ from .employee_admin_views import (
     EmployeeTicketsStatsAPI,
     EmployeeTicketCommentsAPI,
     EmployeeTicketCommentsFlatAPI,
+    EmployeeTicketCommentDetailAPI,
     EmployeeSetPasswordAPI,
     LeaveBalanceAPI,
     EmployeeMeAPI,
@@ -64,6 +65,7 @@ from .private_project_views import (
     PrivateProjectPlanAssignmentsAPI,
     PrivateProjectPlanAssignmentAPI,
     PrivateProjectDailyUpdatesAPI,
+    ProjectTicketsAPI,
 )
 from .dashboard_views import DashboardSummaryAPI
 from rest_framework.routers import DefaultRouter
@@ -137,6 +139,10 @@ urlpatterns = [
     path('api/employee-tickets/stats/', EmployeeTicketsStatsAPI.as_view(), name='employee-tickets-stats'),
     path('api/employee-tickets/bulk-assign/', EmployeeTicketBulkAssignAPI.as_view(), name='employee-tickets-bulk-assign'),
     path('api/employee-tickets/<int:pk>/comments/', EmployeeTicketCommentsAPI.as_view(), name='employee-ticket-comments'),
+    path('api/employee-tickets/<int:ticket_pk>/comments/<int:pk>/', EmployeeTicketCommentDetailAPI.as_view(), name='employee-ticket-comment-detail'),
+    path('api/employee-tickets/<int:ticket_pk>/comments/<int:pk>', EmployeeTicketCommentDetailAPI.as_view(), name='employee-ticket-comment-detail-noslash'),
+    path('api/employee-ticket-comments/<int:pk>/', EmployeeTicketCommentDetailAPI.as_view(), name='employee-ticket-comment-flat-detail'),
+    path('api/employee-ticket-comments/<int:pk>', EmployeeTicketCommentDetailAPI.as_view(), name='employee-ticket-comment-flat-detail-noslash'),
     path('api/employee-tickets/undefined', EmployeeTicketsAPI.as_view(), name='employee-tickets-undefined-noslash'),
     path('api/employee-tickets/undefined/', EmployeeTicketsAPI.as_view(), name='employee-tickets-undefined'),
     path('api/employee-tickets/null', EmployeeTicketsAPI.as_view(), name='employee-tickets-null-noslash'),
@@ -180,6 +186,7 @@ urlpatterns = [
     path('api/projects/', ProjectAPI.as_view(), name='project-list'),
     path('api/projects/new/', ProjectDraftAPI.as_view(), name='project-draft'),
     path('api/projects/<int:pk>/', ProjectAPI.as_view(), name='project-detail'),
+    path('api/projects/<int:pk>/tickets/', ProjectTicketsAPI.as_view(), name='projects-tickets'),
     path('api/employees/projects', EmployeeProjectsAPI.as_view(), name='employee-projects-noslash'),
     path('api/employees/projects/', EmployeeProjectsAPI.as_view(), name='employee-projects'),
     path('api/employees/me/projects', EmployeeProjectsAPI.as_view(), name='employees-me-projects-noslash'),
@@ -194,6 +201,7 @@ urlpatterns = [
 
     path('api/private-projects/', PrivateProjectsAPI.as_view(), name='private-projects-list'),
     path('api/private-projects/<int:pk>/', PrivateProjectDetailAPI.as_view(), name='private-projects-detail'),
+    path('api/private-projects/<int:pk>/tickets/', ProjectTicketsAPI.as_view(), name='private-projects-tickets'),
     path('api/private-projects/<int:pk>/plan/', PrivateProjectPlanAPI.as_view(), name='private-projects-plan'),
     path('api/private-projects/<int:pk>/plan/assignments/', PrivateProjectPlanAssignmentsAPI.as_view(), name='private-projects-plan-assignments'),
     path('api/private-projects/<int:pk>/plan/assignments/<int:assignment_id>/', PrivateProjectPlanAssignmentAPI.as_view(), name='private-projects-plan-assignment'),

@@ -16,7 +16,9 @@ from account.employee_models import (
     PrivateProjectPlan,
     PrivateProjectAssignment,
     PrivateProjectDailyUpdate,
+    PrivateProjectTicketAssignment,
     CurrentProjectPlan,
+    CurrentProjectTicketAssignment,
 )
 from account.employee_serializers import (
     PrivateProjectPlanSerializer,
@@ -207,6 +209,26 @@ def _refresh_employee_private_project(employee):
         employee.save(update_fields=["private_project", "updated_at"])
 
 
+def _sync_project_status_from_payload(project, payload, plan_payload=None):
+    if not project:
+        return
+    status_candidate = None
+    if isinstance(plan_payload, dict):
+        status_candidate = plan_payload.get("status")
+    if status_candidate is None and isinstance(payload, dict):
+        status_candidate = payload.get("status")
+    if status_candidate is not None:
+        s_val = str(status_candidate).strip().lower()
+        if s_val in {"active", "in_progress", "in-progress"}:
+            s_val = "ongoing"
+        elif s_val in {"on_hold", "on-hold", "paused"}:
+            s_val = "planned"
+        if s_val in {"planned", "ongoing", "completed"}:
+            if getattr(project, "status", None) != s_val:
+                project.status = s_val
+                project.save(update_fields=["status"])
+
+
 def _apply_private_assignments(plan, payload, request):
     assignments_payload = payload.get("assignments")
     assignments_payload = payload.get("employees", assignments_payload)
@@ -273,10 +295,53 @@ def _apply_private_assignments(plan, payload, request):
 
 
 def _private_project_payload(project, request, *, summary=False):
-    plan = getattr(project, "private_project_plan", None)
-    plan_data = PrivateProjectPlanSerializer(plan, context={"request": request}).data if plan else None
+    plan = getattr(project, "private_project_plan", None) or getattr(project, "current_project_plan", None)
+    if isinstance(plan, CurrentProjectPlan):
+        plan_data = CurrentProjectPlanSerializer(plan, context={"request": request}).data
+    else:
+        plan_data = PrivateProjectPlanSerializer(plan, context={"request": request}).data if plan else None
+
     assigned_ids = [a.employee_id for a in getattr(plan, "assignments", []).all()] if plan else []
     assigned_codes = [a.employee.employee_id for a in getattr(plan, "assignments", []).all() if getattr(a, "employee", None)] if plan else []
+
+    project_tickets = []
+    if isinstance(plan_data, dict) and plan_data.get("tickets"):
+        project_tickets = plan_data.get("tickets") or []
+    elif project is not None:
+        private_t_ids = set(
+            PrivateProjectTicketAssignment.objects.filter(plan__project=project).values_list("ticket_id", flat=True)
+        )
+        current_t_ids = set(
+            CurrentProjectTicketAssignment.objects.filter(plan__project=project).values_list("ticket_id", flat=True)
+        )
+        combined_ids = private_t_ids | current_t_ids
+        if combined_ids:
+            from account.employee_models import EmployeeTicket
+            t_qs = (
+                EmployeeTicket.objects.filter(pk__in=combined_ids)
+                .select_related("assigned_to", "assigned_to__user")
+                .prefetch_related("assignees", "assignees__user")
+                .order_by("-created_at")
+            )
+            for t in t_qs:
+                assignees_list = list(t.assignees.all()) or ([t.assigned_to] if t.assigned_to else [])
+                project_tickets.append({
+                    "id": t.pk,
+                    "ticket_number": t.ticket_number or "",
+                    "title": t.title or "",
+                    "description": t.description or "",
+                    "status": t.status or "",
+                    "priority": t.priority or "",
+                    "assignees": [
+                        {
+                            "id": e.id,
+                            "name": _employee_label(e),
+                            "employee_code": getattr(e, "employee_id", ""),
+                        }
+                        for e in assignees_list
+                    ],
+                    "created_at": t.created_at.isoformat() if t.created_at else None,
+                })
 
     if summary and isinstance(plan_data, dict):
         assignments = plan_data.pop("assignments", None)
@@ -302,6 +367,7 @@ def _private_project_payload(project, request, *, summary=False):
     return {
         "id": project.id,
         "project_id": project.id,
+
         "project": {
             "id": project.id,
             "title": getattr(project, "title", "") or "",
@@ -311,15 +377,20 @@ def _private_project_payload(project, request, *, summary=False):
             "start_date": getattr(project, "start_date", None),
             "end_date": getattr(project, "end_date", None),
         },
+
         "title": project_name,
         "description": project_description,
-        "status": (plan_data.get("status") if isinstance(plan_data, dict) else "") or "planned",
+
+        # IMPORTANT
+        "status": getattr(project, "status", None),
+
         "timeline": timeline,
         "start_date": start_date,
         "end_date": end_date,
         "project_name": project_name,
         "project_description": project_description,
         "plan": plan_data,
+        "tickets": project_tickets,
         "assigned_employee_ids": assigned_ids,
         "assigned_employee_codes": assigned_codes,
     }
@@ -426,6 +497,7 @@ class PrivateProjectsAPI(APIView):
         serializer = PrivateProjectPlanSerializer(plan, data=data, partial=True, context={"request": request})
         serializer.is_valid(raise_exception=True)
         plan = serializer.save()
+        _sync_project_status_from_payload(project, payload, plan_payload)
         _apply_private_assignments(plan, plan_payload if isinstance(plan_payload, dict) else {}, request)
         plan = (
             PrivateProjectPlan.objects.select_related("project")
@@ -440,7 +512,11 @@ class PrivateProjectsAPI(APIView):
 
 
 class PrivateProjectDetailAPI(APIView):
-    authentication_classes = [CookieJWTAuthentication, QuietJWTAuthentication, SessionAuthentication]
+    authentication_classes = [
+        CookieJWTAuthentication,
+        QuietJWTAuthentication,
+        SessionAuthentication,
+    ]
     permission_classes = [CanAccessPrivateProject]
     parser_classes = [JSONParser]
 
@@ -448,9 +524,25 @@ class PrivateProjectDetailAPI(APIView):
         return _private_permissions(self.request)
 
     def get(self, request, pk):
+        """
+        Get a private project by ID.
+
+        Important:
+        Do NOT use _project_queryset_for_user() here because that queryset
+        requires private_project_plan__isnull=False.
+
+        An existing Project may not have a PrivateProjectPlan yet.
+        In that case, we create the plan automatically and return the
+        existing project data.
+        """
+
+        # Fetch the project directly.
         project = (
-            _project_queryset_for_user(request.user)
-            .select_related("private_project_plan")
+            Project.objects
+            .select_related(
+                "project_manager",
+                "private_project_plan",
+            )
             .prefetch_related(
                 "private_project_plan__assignments",
                 "private_project_plan__assignments__daily_updates",
@@ -458,17 +550,80 @@ class PrivateProjectDetailAPI(APIView):
             .filter(pk=pk)
             .first()
         )
+
         if project is None:
-            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
-        if not (settings.DEBUG and not getattr(request.user, "is_authenticated", False)):
+            return Response(
+                {"detail": "Not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # ---------------------------------------------------------
+        # Permission check
+        # ---------------------------------------------------------
+        if not (
+            settings.DEBUG
+            and not getattr(request.user, "is_authenticated", False)
+        ):
             try:
                 self.check_object_permissions(request, project)
             except Exception:
                 if not _is_admin(request.user):
-                    return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+                    return Response(
+                        {"detail": "Not found"},
+                        status=status.HTTP_404_NOT_FOUND,
+                    )
                 raise
-        response_payload = _private_project_payload(project, request, summary=False)
-        return Response(response_payload, status=status.HTTP_200_OK)
+
+        # ---------------------------------------------------------
+        # Get existing private project plan
+        # ---------------------------------------------------------
+        plan = getattr(project, "private_project_plan", None)
+
+        # ---------------------------------------------------------
+        # If no private plan exists, create one automatically
+        # from the existing Project information.
+        # ---------------------------------------------------------
+        if plan is None:
+            plan = PrivateProjectPlan.objects.create(
+                project=project,
+                start_date=project.start_date,
+                end_date=project.end_date,
+                timeline=getattr(project, "timeline", "") or "",
+                project_name=getattr(project, "title", "") or "",
+                project_description=getattr(
+                    project,
+                    "description",
+                    "",
+                ) or "",
+            )
+
+            # Refresh the project relationship after creating the plan.
+            project = (
+                Project.objects
+                .select_related(
+                    "project_manager",
+                    "private_project_plan",
+                )
+                .prefetch_related(
+                    "private_project_plan__assignments",
+                    "private_project_plan__assignments__daily_updates",
+                )
+                .get(pk=project.pk)
+            )
+
+        # ---------------------------------------------------------
+        # Return the same payload structure used by the list API
+        # ---------------------------------------------------------
+        response_payload = _private_project_payload(
+            project,
+            request,
+            summary=False,
+        )
+
+        return Response(
+            response_payload,
+            status=status.HTTP_200_OK,
+        )
 
     def patch(self, request, pk):
         return self._save_plan(request, pk, partial=True)
@@ -477,67 +632,223 @@ class PrivateProjectDetailAPI(APIView):
         return self._save_plan(request, pk, partial=False)
 
     def delete(self, request, pk):
-        project = _project_queryset_for_user(request.user).filter(pk=pk).first()
-        if project is None:
-            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
-        if not _is_admin(request.user):
-            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+        """
+        Delete the private project plan.
 
-        plan = PrivateProjectPlan.objects.filter(project=project).first()
-        if plan is None:
-            return Response(status=status.HTTP_204_NO_CONTENT)
+        The underlying Project is NOT deleted.
+        """
 
-        assigned_employee_ids = list(plan.assignments.values_list("employee_id", flat=True))
-        linked_employee_ids = list(
-            EmployeeProfile.objects.filter(private_project_id=project.id).values_list("id", flat=True)
+        # Do not use _project_queryset_for_user() here because the
+        # project may not have a private plan.
+        project = (
+            Project.objects
+            .select_related(
+                "project_manager",
+                "private_project_plan",
+            )
+            .filter(pk=pk)
+            .first()
         )
+
+        if project is None:
+            return Response(
+                {"detail": "Not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not _is_admin(request.user):
+            return Response(
+                {"detail": "Forbidden"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        plan = PrivateProjectPlan.objects.filter(
+            project=project
+        ).first()
+
+        if plan is None:
+            return Response(
+                status=status.HTTP_204_NO_CONTENT
+            )
+
+        # Save employees affected by this private project before
+        # deleting the plan.
+        assigned_employee_ids = list(
+            plan.assignments.values_list(
+                "employee_id",
+                flat=True,
+            )
+        )
+
+        linked_employee_ids = list(
+            EmployeeProfile.objects
+            .filter(private_project_id=project.id)
+            .values_list("id", flat=True)
+        )
+
         affected_employee_ids = {
             int(employee_id)
-            for employee_id in [*assigned_employee_ids, *linked_employee_ids]
+            for employee_id in [
+                *assigned_employee_ids,
+                *linked_employee_ids,
+            ]
             if employee_id is not None
         }
 
+        # Delete only the private project plan.
+        # The original Project remains available.
         plan.delete()
 
-        EmployeeProfile.objects.filter(private_project_id=project.id).update(
+        # Remove direct private-project links.
+        EmployeeProfile.objects.filter(
+            private_project_id=project.id
+        ).update(
             private_project=None,
             updated_at=timezone.now(),
         )
+
+        # Restore another private project if the employee has one.
         for employee_id in affected_employee_ids:
-            employee_obj = EmployeeProfile.objects.filter(pk=employee_id).first()
+            employee_obj = EmployeeProfile.objects.filter(
+                pk=employee_id
+            ).first()
+
             _refresh_employee_private_project(employee_obj)
 
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response(
+            status=status.HTTP_204_NO_CONTENT
+        )
 
     def _save_plan(self, request, pk, partial):
-        project = _project_queryset_for_user(request.user).filter(pk=pk).first()
+        """
+        Create/update the PrivateProjectPlan for an existing Project.
+        """
+
+        # ---------------------------------------------------------
+        # Fetch project directly.
+        # ---------------------------------------------------------
+        project = (
+            Project.objects
+            .select_related(
+                "project_manager",
+                "private_project_plan",
+            )
+            .filter(pk=pk)
+            .first()
+        )
+
         if project is None:
-            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "Not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # ---------------------------------------------------------
+        # Only admin can edit private project plans.
+        # ---------------------------------------------------------
         if not _is_admin(request.user):
-            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {"detail": "Forbidden"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
-        payload = request.data if isinstance(request.data, dict) else {}
-        plan_payload = payload.get("plan") if isinstance(payload.get("plan"), dict) else payload
-        data = _clean_private_plan_write_payload(plan_payload, project)
+        payload = (
+            request.data
+            if isinstance(request.data, dict)
+            else {}
+        )
 
-        plan = PrivateProjectPlan.objects.filter(project=project).first()
+        plan_payload = (
+            payload.get("plan")
+            if isinstance(payload.get("plan"), dict)
+            else payload
+        )
+
+        # ---------------------------------------------------------
+        # Find existing plan.
+        # If it doesn't exist, create it from the Project.
+        # ---------------------------------------------------------
+        plan = PrivateProjectPlan.objects.filter(
+            project=project
+        ).first()
+
         if plan is None:
-            plan = PrivateProjectPlan.objects.create(project=project)
-        serializer = PrivateProjectPlanSerializer(plan, data=data, partial=partial, context={"request": request})
+            plan = PrivateProjectPlan.objects.create(
+                project=project,
+                start_date=project.start_date,
+                end_date=project.end_date,
+                timeline=getattr(project, "timeline", "") or "",
+                project_name=getattr(project, "title", "") or "",
+                project_description=getattr(
+                    project,
+                    "description",
+                    "",
+                ) or "",
+            )
+
+        # ---------------------------------------------------------
+        # Clean incoming plan data.
+        # ---------------------------------------------------------
+        data = _clean_private_plan_write_payload(
+            plan_payload,
+            project,
+        )
+
+        # ---------------------------------------------------------
+        # Update the private plan.
+        # ---------------------------------------------------------
+        serializer = PrivateProjectPlanSerializer(
+            plan,
+            data=data,
+            partial=partial,
+            context={"request": request},
+        )
+
         serializer.is_valid(raise_exception=True)
+
         plan = serializer.save()
-        _apply_private_assignments(plan, plan_payload if isinstance(plan_payload, dict) else {}, request)
+        _sync_project_status_from_payload(project, payload, plan_payload)
+
+        # ---------------------------------------------------------
+        # Update employee assignments.
+        # ---------------------------------------------------------
+        _apply_private_assignments(
+            plan,
+            plan_payload
+            if isinstance(plan_payload, dict)
+            else {},
+            request,
+        )
+
+        # ---------------------------------------------------------
+        # Reload plan with assignments and daily updates.
+        # ---------------------------------------------------------
         plan = (
-            PrivateProjectPlan.objects.select_related("project")
-            .prefetch_related("assignments", "assignments__daily_updates", "ticket_assignments")
+            PrivateProjectPlan.objects
+            .select_related("project")
+            .prefetch_related(
+                "assignments",
+                "assignments__daily_updates",
+                "ticket_assignments",
+            )
             .filter(pk=plan.pk)
             .first()
             or plan
         )
 
-        response_payload = _private_project_payload(project, request, summary=False)
-        return Response(response_payload, status=status.HTTP_200_OK)
+        # ---------------------------------------------------------
+        # Return the same payload structure expected by frontend.
+        # ---------------------------------------------------------
+        response_payload = _private_project_payload(
+            project,
+            request,
+            summary=False,
+        )
 
+        return Response(
+            response_payload,
+            status=status.HTTP_200_OK,
+        )
 
 class PrivateProjectPlanAPI(APIView):
     authentication_classes = [CookieJWTAuthentication, QuietJWTAuthentication, SessionAuthentication]
@@ -610,6 +921,7 @@ class PrivateProjectPlanAPI(APIView):
         serializer = PrivateProjectPlanSerializer(plan, data=data, partial=True, context={"request": request})
         serializer.is_valid(raise_exception=True)
         plan = serializer.save()
+        _sync_project_status_from_payload(project, incoming)
         _apply_private_assignments(plan, incoming, request)
         return Response(PrivateProjectPlanSerializer(plan, context={"request": request}).data, status=status.HTTP_200_OK)
 
@@ -710,6 +1022,107 @@ class PrivateProjectPlanAssignmentAPI(APIView):
         assignment.delete()
         _refresh_employee_private_project(employee_obj)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ProjectTicketsAPI(APIView):
+    """
+    GET /api/private-projects/<pk>/tickets/
+
+    Returns ONLY the EmployeeTickets linked to this specific project through
+    the existing bridge models:
+      - PrivateProjectTicketAssignment  (for private-project plans)
+      - CurrentProjectTicketAssignment  (for current-project plans)
+
+    Ticket fields returned: id, ticket_number, title, status, priority,
+    assignees (list of {id, name, employee_code}).
+
+    Both private and current project flows are handled transparently.
+    """
+
+    authentication_classes = [CookieJWTAuthentication, QuietJWTAuthentication, SessionAuthentication]
+    permission_classes = [CanAccessPrivateProject]
+
+    def get_permissions(self):
+        return _private_permissions(self.request)
+
+    def get(self, request, pk):
+        project = _project_by_pk(pk)
+        if project is None:
+            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Collect ticket IDs from both bridge tables (no new FK on EmployeeTicket).
+        private_ticket_ids = set(
+            PrivateProjectTicketAssignment.objects
+            .filter(plan__project=project)
+            .values_list("ticket_id", flat=True)
+        )
+        current_ticket_ids = set(
+            CurrentProjectTicketAssignment.objects
+            .filter(plan__project=project)
+            .values_list("ticket_id", flat=True)
+        )
+        all_ticket_ids = private_ticket_ids | current_ticket_ids
+
+        if not all_ticket_ids:
+            return Response([], status=status.HTTP_200_OK)
+
+        from account.employee_models import EmployeeTicket
+        tickets = (
+            EmployeeTicket.objects
+            .filter(pk__in=all_ticket_ids)
+            .select_related("assigned_to", "assigned_to__user", "employee", "employee__user")
+            .prefetch_related("assignees", "assignees__user")
+            .order_by("-created_at")
+        )
+
+        def _employee_label(ep):
+            if ep is None:
+                return ""
+            u = getattr(ep, "user", None)
+            first = getattr(u, "firstname", "") or getattr(u, "first_name", "") or ""
+            last = getattr(u, "lastname", "") or getattr(u, "last_name", "") or ""
+            full = f"{first} {last}".strip()
+            return full or getattr(u, "username", "") or getattr(u, "email", "") or f"Employee #{ep.id}"
+
+        def _emp_info(ep):
+            if not ep:
+                return None
+            return {
+                "id": ep.id,
+                "name": _employee_label(ep),
+                "employee_code": getattr(ep, "employee_id", ""),
+            }
+
+        def _assignees(ticket):
+            employees = list(ticket.assignees.all())
+            if not employees and ticket.assigned_to:
+                employees = [ticket.assigned_to]
+            return [
+                {
+                    "id": e.id,
+                    "name": _employee_label(e),
+                    "employee_code": getattr(e, "employee_id", ""),
+                }
+                for e in employees
+            ]
+
+        data = [
+            {
+                "id": t.pk,
+                "ticket_number": t.ticket_number or "",
+                "title": t.title or "",
+                "description": t.description or "",
+                "status": t.status or "",
+                "priority": t.priority or "",
+                "employee": _emp_info(t.employee),
+                "assigned_to": _emp_info(t.assigned_to),
+                "assignees": _assignees(t),
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+            }
+            for t in tickets
+        ]
+
+        return Response(data, status=status.HTTP_200_OK)
 
 
 class PrivateProjectDailyUpdatesAPI(APIView):
